@@ -1,6 +1,6 @@
 [project]
 name = "mcp-google-gmail"
-version = "0.1.2"
+version = "0.1.3"
 description = "MCP server for Gmail API — list, read, send, draft, label, and trash emails"
 readme = "README.md"
 requires-python = ">=3.11"

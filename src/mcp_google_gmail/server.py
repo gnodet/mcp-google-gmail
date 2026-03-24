@@ -596,6 +596,119 @@ def gmail_send_message(
 
 
 @mcp.tool()
+def gmail_reply_on_message(
+    ctx: Context,
+    message_id: str,
+    body: str,
+    reply_all: bool = False,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html_body: str | None = None,
+    attachment_paths: list[str] | None = None,
+) -> dict:
+    """Reply to an existing email message.
+
+    Automatically fetches the original message to set the correct recipient,
+    subject (with "Re:" prefix), thread ID, and In-Reply-To / References
+    headers for proper threading.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        message_id: The Gmail message ID to reply to.
+        body: Plain text reply body.
+        reply_all: If True, reply to all original recipients (To + CC).
+        cc: Additional CC recipients (comma-separated). Merged with original CC when reply_all is True.
+        bcc: BCC recipients, comma-separated.
+        html_body: HTML version of the reply body.
+        attachment_paths: List of absolute file paths to attach.
+    """
+    try:
+        service = _get_service(ctx)
+
+        # Fetch the original message headers
+        original = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=message_id,
+                format="metadata",
+                metadataHeaders=["Subject", "From", "To", "Cc", "Message-ID"],
+            )
+            .execute()
+        )
+        headers = {
+            h["name"]: h["value"]
+            for h in original.get("payload", {}).get("headers", [])
+        }
+        thread_id = original.get("threadId", "")
+        original_message_id_header = headers.get("Message-ID", "")
+        original_subject = headers.get("Subject", "")
+        original_from = headers.get("From", "")
+        original_to = headers.get("To", "")
+        original_cc = headers.get("Cc", "")
+
+        # Build the reply subject
+        subject = original_subject
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+
+        # Determine the reply recipient
+        # Get our own email to exclude from recipients
+        profile = service.users().getProfile(userId="me").execute()
+        my_email = profile.get("emailAddress", "").lower()
+
+        # Reply goes to the original sender
+        to = original_from
+
+        # For reply_all, add original To and CC (excluding ourselves)
+        merged_cc = ""
+        if reply_all:
+            all_recipients = []
+            for addr_list in [original_to, original_cc]:
+                if addr_list:
+                    all_recipients.extend(
+                        a.strip() for a in addr_list.split(",") if a.strip()
+                    )
+            # Filter out our own address
+            filtered = [a for a in all_recipients if my_email not in a.lower()]
+            # Also exclude the sender (already in "to")
+            if original_from:
+                sender_lower = original_from.lower()
+                filtered = [a for a in filtered if sender_lower not in a.lower()]
+            if filtered:
+                merged_cc = ", ".join(filtered)
+
+        # Merge user-provided CC with reply-all CC
+        if cc and merged_cc:
+            merged_cc = f"{merged_cc}, {cc}"
+        elif cc:
+            merged_cc = cc
+
+        message_body = _build_message(
+            to=to,
+            subject=subject,
+            body=body,
+            cc=merged_cc or None,
+            bcc=bcc,
+            html_body=html_body,
+            attachment_paths=attachment_paths,
+            reply_to_message_id=original_message_id_header,
+            thread_id=thread_id,
+        )
+        sent = service.users().messages().send(userId="me", body=message_body).execute()
+        return {
+            "id": sent["id"],
+            "thread_id": sent.get("threadId", ""),
+            "label_ids": sent.get("labelIds", []),
+        }
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
 def gmail_create_draft(
     ctx: Context,
     to: str,
