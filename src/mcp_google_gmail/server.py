@@ -13,6 +13,7 @@ Authentication priority:
 
 import base64
 import email
+import email.utils
 import json
 import mimetypes
 import os
@@ -633,7 +634,14 @@ def gmail_reply_on_message(
                 userId="me",
                 id=message_id,
                 format="metadata",
-                metadataHeaders=["Subject", "From", "To", "Cc", "Message-ID"],
+                metadataHeaders=[
+                    "Subject",
+                    "From",
+                    "To",
+                    "Cc",
+                    "Message-ID",
+                    "Reply-To",
+                ],
             )
             .execute()
         )
@@ -647,35 +655,47 @@ def gmail_reply_on_message(
         original_from = headers.get("From", "")
         original_to = headers.get("To", "")
         original_cc = headers.get("Cc", "")
+        original_reply_to = headers.get("Reply-To", "")
 
         # Build the reply subject
         subject = original_subject
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
 
-        # Determine the reply recipient
+        # Extract clean email addresses using email.utils
+        # "John Doe <john@example.com>" -> "john@example.com"
+        def _parse_addr(header_value: str) -> str:
+            _, addr = email.utils.parseaddr(header_value)
+            return addr
+
+        def _parse_addr_list(header_value: str) -> list[str]:
+            return [
+                addr for _, addr in email.utils.getaddresses([header_value]) if addr
+            ]
+
         # Get our own email to exclude from recipients
         profile = service.users().getProfile(userId="me").execute()
         my_email = profile.get("emailAddress", "").lower()
 
-        # Reply goes to the original sender
-        to = original_from
+        # Reply-To header takes priority over From
+        if original_reply_to:
+            to = _parse_addr(original_reply_to)
+        else:
+            to = _parse_addr(original_from)
 
-        # For reply_all, add original To and CC (excluding ourselves)
+        # For reply_all, add original To and CC (excluding ourselves and the sender)
         merged_cc = ""
         if reply_all:
-            all_recipients = []
+            all_recipients: list[str] = []
             for addr_list in [original_to, original_cc]:
                 if addr_list:
-                    all_recipients.extend(
-                        a.strip() for a in addr_list.split(",") if a.strip()
-                    )
-            # Filter out our own address
-            filtered = [a for a in all_recipients if my_email not in a.lower()]
-            # Also exclude the sender (already in "to")
-            if original_from:
-                sender_lower = original_from.lower()
-                filtered = [a for a in filtered if sender_lower not in a.lower()]
+                    all_recipients.extend(_parse_addr_list(addr_list))
+            # Filter out our own address and the primary reply recipient
+            filtered = [
+                a
+                for a in all_recipients
+                if a.lower() != my_email and a.lower() != to.lower()
+            ]
             if filtered:
                 merged_cc = ", ".join(filtered)
 
