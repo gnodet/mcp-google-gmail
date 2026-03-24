@@ -17,6 +17,7 @@ import email.utils
 import json
 import mimetypes
 import os
+import re
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -271,6 +272,69 @@ def _extract_attachments(payload: dict) -> list[dict]:
     return attachments
 
 
+# ---------------------------------------------------------------------------
+# Helper: text cleaning for LLM-friendly output
+# ---------------------------------------------------------------------------
+
+# Pattern matching "On <Day>, <Mon> <D>, <YYYY> at <time> <Name> <email> wrote:"
+# Gmail often wraps this across 2-3 lines, so we use DOTALL to match across newlines.
+_QUOTED_REPLY_PATTERNS = [
+    # "On <date> <name> <email> wrote:" (Gmail style, may span multiple lines)
+    re.compile(r"\nOn .+?wrote:\s*\n", re.DOTALL),
+    # "---------- Forwarded message ----------"
+    re.compile(r"^-{5,}\s*Forwarded message\s*-{5,}", re.MULTILINE),
+    # "> " quoted lines after a blank line (catches remaining quoted blocks)
+    re.compile(r"\n\n(?:>.*\n?){3,}"),
+]
+
+# Common email signature markers
+_SIGNATURE_PATTERNS = [
+    re.compile(r"^--\s*$", re.MULTILINE),  # "-- " standard sig separator
+    re.compile(r"^Sent from my (?:iPhone|iPad|Android)", re.MULTILINE),
+    re.compile(r"^Get Outlook for", re.MULTILINE),
+    # "CONFIDENTIALITY NOTICE" boilerplate
+    re.compile(r"^CONFIDENTIALITY NOTICE", re.MULTILINE),
+]
+
+
+def _strip_quoted_reply(text: str) -> str:
+    """Remove quoted reply content from an email body, keeping only the new content."""
+    if not text:
+        return text
+
+    # Find the earliest match of any quoted reply pattern
+    earliest_pos = len(text)
+    for pattern in _QUOTED_REPLY_PATTERNS:
+        match = pattern.search(text)
+        if match and match.start() < earliest_pos:
+            earliest_pos = match.start()
+
+    return text[:earliest_pos].rstrip()
+
+
+def _strip_signature(text: str) -> str:
+    """Remove email signatures from the body text."""
+    if not text:
+        return text
+
+    earliest_pos = len(text)
+    for pattern in _SIGNATURE_PATTERNS:
+        match = pattern.search(text)
+        if match and match.start() < earliest_pos:
+            earliest_pos = match.start()
+
+    return text[:earliest_pos].rstrip()
+
+
+def _clean_body_text(text: str) -> str:
+    """Strip quoted replies, signatures, and excessive whitespace from body text."""
+    text = _strip_quoted_reply(text)
+    text = _strip_signature(text)
+    # Collapse runs of 3+ newlines into 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _parse_full_message(msg: dict) -> dict:
     headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
     body_text, body_html = _extract_body(msg.get("payload", {}))
@@ -402,12 +466,19 @@ def gmail_list_messages(
 
 
 @mcp.tool()
-def gmail_get_message(ctx: Context, message_id: str) -> dict:
+def gmail_get_message(
+    ctx: Context,
+    message_id: str,
+    clean: bool = True,
+) -> dict:
     """Get a single email message by ID with full body, headers, and attachments.
 
     Args:
         ctx: MCP context (injected automatically).
         message_id: The Gmail message ID.
+        clean: If True (default), return only the new content of the message
+               (strips quoted replies, signatures, and HTML body). Set to False
+               for the raw unprocessed body text and HTML.
     """
     try:
         service = _get_service(ctx)
@@ -417,7 +488,72 @@ def gmail_get_message(ctx: Context, message_id: str) -> dict:
             .get(userId="me", id=message_id, format="full")
             .execute()
         )
-        return _parse_full_message(msg)
+        result = _parse_full_message(msg)
+        if clean:
+            result["body_text"] = _clean_body_text(result["body_text"])
+            del result["body_html"]
+        return result
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_thread(
+    ctx: Context,
+    thread_id: str,
+) -> dict:
+    """Get an entire email thread as a deduplicated chronological conversation.
+
+    Returns each message with only its NEW content (quoted replies and signatures
+    stripped), plus metadata. This is far more token-efficient than fetching each
+    message individually, especially for long threads.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        thread_id: The Gmail thread ID (available from search results as thread_id).
+    """
+    try:
+        service = _get_service(ctx)
+        thread = (
+            service.users()
+            .threads()
+            .get(userId="me", id=thread_id, format="full")
+            .execute()
+        )
+        messages = []
+        for msg in thread.get("messages", []):
+            parsed = _parse_full_message(msg)
+            cleaned_text = _clean_body_text(parsed["body_text"])
+            messages.append(
+                {
+                    "id": parsed["id"],
+                    "from": parsed["from"],
+                    "to": parsed["to"],
+                    "cc": parsed["cc"],
+                    "date": parsed["date"],
+                    "body_text": cleaned_text,
+                    "attachments": [
+                        {"filename": a["filename"], "size": a["size"]}
+                        for a in parsed["attachments"]
+                        if a.get("filename")
+                    ],
+                }
+            )
+        # Get subject from the first message's parsed data
+        first_msg = thread.get("messages", [{}])[0]
+        first_headers = {
+            h["name"]: h["value"]
+            for h in first_msg.get("payload", {}).get("headers", [])
+        }
+
+        return {
+            "thread_id": thread_id,
+            "subject": first_headers.get("Subject", ""),
+            "message_count": len(messages),
+            "messages": messages,
+        }
     except HttpError as e:
         return {"error": str(e), "status_code": e.resp.status}
     except Exception as e:
