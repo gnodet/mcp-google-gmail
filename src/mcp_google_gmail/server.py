@@ -503,6 +503,8 @@ def gmail_get_message(
 def gmail_get_thread(
     ctx: Context,
     thread_id: str,
+    offset: int = 0,
+    limit: int | None = None,
 ) -> dict:
     """Get an entire email thread as a deduplicated chronological conversation.
 
@@ -510,9 +512,16 @@ def gmail_get_thread(
     stripped), plus metadata. This is far more token-efficient than fetching each
     message individually, especially for long threads.
 
+    For very long threads (50+ messages), use offset and limit to paginate:
+        - First call: gmail_get_thread(thread_id="...") to see message_count
+        - Then: gmail_get_thread(thread_id="...", offset=0, limit=25)
+        - Then: gmail_get_thread(thread_id="...", offset=25, limit=25)
+
     Args:
         ctx: MCP context (injected automatically).
         thread_id: The Gmail thread ID (available from search results as thread_id).
+        offset: Start from this message index (0-based, default 0).
+        limit: Maximum number of messages to return. None returns all messages.
     """
     try:
         service = _get_service(ctx)
@@ -522,8 +531,22 @@ def gmail_get_thread(
             .get(userId="me", id=thread_id, format="full")
             .execute()
         )
+        all_messages = thread.get("messages", [])
+        total_count = len(all_messages)
+
+        # Get subject from the first message
+        first_msg = all_messages[0] if all_messages else {}
+        first_headers = {
+            h["name"]: h["value"]
+            for h in first_msg.get("payload", {}).get("headers", [])
+        }
+
+        # Apply pagination
+        end = offset + limit if limit is not None else total_count
+        page = all_messages[offset:end]
+
         messages = []
-        for msg in thread.get("messages", []):
+        for msg in page:
             parsed = _parse_full_message(msg)
             cleaned_text = _clean_body_text(parsed["body_text"])
             messages.append(
@@ -541,19 +564,20 @@ def gmail_get_thread(
                     ],
                 }
             )
-        # Get subject from the first message's parsed data
-        first_msg = thread.get("messages", [{}])[0]
-        first_headers = {
-            h["name"]: h["value"]
-            for h in first_msg.get("payload", {}).get("headers", [])
-        }
 
-        return {
+        result = {
             "thread_id": thread_id,
             "subject": first_headers.get("Subject", ""),
-            "message_count": len(messages),
+            "message_count": total_count,
             "messages": messages,
         }
+        # Include pagination hints when not returning all messages
+        if limit is not None:
+            result["offset"] = offset
+            result["limit"] = limit
+            if end < total_count:
+                result["next_offset"] = end
+        return result
     except HttpError as e:
         return {"error": str(e), "status_code": e.resp.status}
     except Exception as e:
