@@ -21,6 +21,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from email import encoders
 from email.mime.audio import MIMEAudio
 from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
@@ -173,6 +174,7 @@ def _attach_file(message: MIMEMultipart, file_path: str) -> None:
     else:
         att = MIMEBase(main_type, sub_type)
         att.set_payload(file_data)
+        encoders.encode_base64(att)
     att.add_header("Content-Disposition", "attachment", filename=path.name)
     message.attach(att)
 
