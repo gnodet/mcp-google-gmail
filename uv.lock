@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -473,8 +473,8 @@ wheels = [
 ]
 
 [[package]]
-name = "mcp-gmail"
-version = "0.1.0"
+name = "mcp-google-gmail"
+version = "0.1.4"
 source = { editable = "." }
 dependencies = [
     { name = "google-api-python-client" },
