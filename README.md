@@ -62,7 +62,8 @@ You're ready! Start issuing commands via your MCP client.
 ## ✨ Key Features
 
 *   **Full Gmail Access:** Read, search, send, draft, label, and trash emails.
-*   **15 Tools** covering all common Gmail operations.
+*   **Multi-Account Support:** Manage multiple Gmail accounts from a single server instance.
+*   **17 Tools** covering all common Gmail operations.
 *   **Flexible Authentication:** Supports OAuth 2.0, Service Accounts, Base64 injection, and Application Default Credentials.
 *   **Pagination:** All list operations support `page_token` and `max_results`.
 *   **Attachments:** Send emails with file attachments.
@@ -140,9 +141,50 @@ Best for Google Cloud environments (Cloud Run, GKE, Compute Engine).
 *   Uses `GOOGLE_APPLICATION_CREDENTIALS` or `gcloud auth application-default login`
 *   No additional env vars needed — used as automatic fallback
 
+### Method E: Multi-Account Configuration 🔄
+
+Best when you need to manage multiple Gmail accounts from a single MCP server instance.
+
+1.  Create an `accounts.json` file:
+    ```json
+    {
+      "accounts": {
+        "personal": {
+          "credentials_path": "~/.config/gmail-personal/credentials.json",
+          "token_path": "~/.config/gmail-personal/token.json"
+        },
+        "work": {
+          "credentials_path": "~/.config/gmail-work/credentials.json",
+          "token_path": "~/.config/gmail-work/token.json"
+        }
+      },
+      "default": "personal"
+    }
+    ```
+
+2.  Authenticate all accounts:
+    ```bash
+    GMAIL_ACCOUNTS_CONFIG="/path/to/accounts.json" uvx mcp-google-gmail@latest auth
+    ```
+
+3.  Each account entry supports the same credential options as single-account mode:
+    *   `credentials_path` — OAuth credentials file
+    *   `token_path` — OAuth token file
+    *   `service_account_path` — Service account key file
+    *   `credentials_config` — Base64-encoded service account JSON
+
+4.  All tools accept an optional `account` parameter to target a specific account. If omitted, the `default` account is used.
+
+5.  Use the `gmail_list_accounts` tool to see all configured accounts and their email addresses.
+
 ---
 
-## 🛠️ Available Tools (15 Total)
+## 🛠️ Available Tools (17 Total)
+
+### Account Management
+
+*   **`gmail_list_accounts`** — List all configured Gmail accounts
+    *   _Returns:_ `{accounts: [{name, email, is_default}], default}`
 
 ### Read Operations
 
@@ -271,6 +313,24 @@ Add the server config to your `claude_desktop_config.json`:
 </details>
 
 <details>
+<summary>🔵 Config: uvx + Multi-Account</summary>
+
+```json
+{
+  "mcpServers": {
+    "gmail": {
+      "command": "uvx",
+      "args": ["mcp-google-gmail@latest"],
+      "env": {
+        "GMAIL_ACCOUNTS_CONFIG": "/path/to/accounts.json"
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
 <summary>🟡 Config: Development (from cloned repo)</summary>
 
 ```json
@@ -342,6 +402,7 @@ For **Service Accounts**: Go to Credentials → Create Credentials → Service A
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
+| `GMAIL_ACCOUNTS_CONFIG` | — | Path to multi-account JSON config file |
 | `GMAIL_CREDENTIALS_CONFIG` | — | Base64-encoded service account JSON |
 | `GMAIL_SERVICE_ACCOUNT_PATH` | `service_account.json` | Path to service account key file |
 | `GMAIL_TOKEN_PATH` | `token.json` | Path to OAuth token file |

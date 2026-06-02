@@ -22,6 +22,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from email import encoders
 from email.mime.audio import MIMEAudio
 from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
@@ -52,6 +53,7 @@ SERVICE_ACCOUNT_PATH = os.environ.get(
 )
 TOKEN_PATH = os.environ.get("GMAIL_TOKEN_PATH", "token.json")
 CREDENTIALS_PATH = os.environ.get("GMAIL_CREDENTIALS_PATH", "credentials.json")
+ACCOUNTS_CONFIG_PATH = os.environ.get("GMAIL_ACCOUNTS_CONFIG")
 
 _resolved_host = os.environ.get("HOST", os.environ.get("FASTMCP_HOST", "0.0.0.0"))
 _resolved_port = int(os.environ.get("PORT", os.environ.get("FASTMCP_PORT", "8000")))
@@ -63,31 +65,41 @@ _resolved_port = int(os.environ.get("PORT", os.environ.get("FASTMCP_PORT", "8000
 
 @dataclass
 class GmailContext:
-    """Context holding the authenticated Gmail service."""
+    """Context holding authenticated Gmail service(s)."""
 
-    service: Any
+    services: dict[str, Any]
+    default_account: str
+    account_emails: dict[str, str]
 
 
-def _authenticate() -> Any:
+def _authenticate_with_paths(
+    credentials_config: str | None = None,
+    service_account_path: str = "service_account.json",
+    token_path: str = "token.json",
+    credentials_path: str = "credentials.json",
+) -> Any:
     """Build an authenticated Gmail API service using the credential chain."""
     creds = None
+    sa_path = Path(service_account_path).expanduser()
+    tk_path = Path(token_path).expanduser()
+    cr_path = Path(credentials_path).expanduser()
 
     # 1. Base64-encoded service account from env var
-    if CREDENTIALS_CONFIG:
-        info = json.loads(base64.b64decode(CREDENTIALS_CONFIG))
+    if credentials_config:
+        info = json.loads(base64.b64decode(credentials_config))
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=SCOPES
         )
 
     # 2. Service account JSON file
-    if not creds and Path(SERVICE_ACCOUNT_PATH).exists():
+    if not creds and sa_path.exists():
         creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_PATH, scopes=SCOPES
+            str(sa_path), scopes=SCOPES
         )
 
     # 3. Existing OAuth token
-    if not creds and Path(TOKEN_PATH).exists():
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    if not creds and tk_path.exists():
+        creds = Credentials.from_authorized_user_file(str(tk_path), SCOPES)
 
     # 4. Refresh or interactive OAuth flow
     if not creds or not creds.valid:
@@ -99,11 +111,11 @@ def _authenticate() -> Any:
             and creds.refresh_token
         ):
             creds.refresh(Request())
-            Path(TOKEN_PATH).write_text(creds.to_json())
-        elif Path(CREDENTIALS_PATH).exists():
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+            tk_path.write_text(creds.to_json())
+        elif cr_path.exists():
+            flow = InstalledAppFlow.from_client_secrets_file(str(cr_path), SCOPES)
             creds = flow.run_local_server(port=0)
-            Path(TOKEN_PATH).write_text(creds.to_json())
+            tk_path.write_text(creds.to_json())
 
     # 5. Application Default Credentials
     if not creds:
@@ -119,12 +131,72 @@ def _authenticate() -> Any:
     return build("gmail", "v1", credentials=creds)
 
 
+def _authenticate() -> Any:
+    """Legacy single-account authentication using env vars."""
+    return _authenticate_with_paths(
+        credentials_config=CREDENTIALS_CONFIG,
+        service_account_path=SERVICE_ACCOUNT_PATH,
+        token_path=TOKEN_PATH,
+        credentials_path=CREDENTIALS_PATH,
+    )
+
+
+def _load_accounts_config() -> tuple[dict[str, Any], str, dict[str, str]]:
+    """Load account config and authenticate all accounts.
+
+    Returns (services, default_account, account_emails).
+    """
+    if not ACCOUNTS_CONFIG_PATH:
+        service = _authenticate()
+        profile = service.users().getProfile(userId="me").execute()
+        email_addr = profile.get("emailAddress", "unknown")
+        return {"default": service}, "default", {"default": email_addr}
+
+    config_path = Path(ACCOUNTS_CONFIG_PATH).expanduser()
+    if not config_path.exists():
+        raise RuntimeError(f"Accounts config not found: {config_path}")
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    accounts = config.get("accounts", {})
+    default = config.get("default")
+    if not accounts:
+        raise RuntimeError(f"No accounts defined in {config_path}")
+    if default and default not in accounts:
+        raise RuntimeError(
+            f"Default account '{default}' not found in accounts: "
+            f"{list(accounts.keys())}"
+        )
+    if not default:
+        default = next(iter(accounts))
+
+    services = {}
+    emails = {}
+    for name, acct in accounts.items():
+        svc = _authenticate_with_paths(
+            credentials_config=acct.get("credentials_config"),
+            service_account_path=acct.get("service_account_path", "service_account.json"),
+            token_path=acct.get("token_path", "token.json"),
+            credentials_path=acct.get("credentials_path", "credentials.json"),
+        )
+        services[name] = svc
+        profile = svc.users().getProfile(userId="me").execute()
+        emails[name] = profile.get("emailAddress", "unknown")
+
+    return services, default, emails
+
+
 @asynccontextmanager
 async def gmail_lifespan(server: FastMCP) -> AsyncIterator[GmailContext]:
-    """Create the Gmail service once at startup."""
-    service = _authenticate()
+    """Authenticate all configured Gmail accounts at startup."""
+    services, default_account, account_emails = _load_accounts_config()
     try:
-        yield GmailContext(service=service)
+        yield GmailContext(
+            services=services,
+            default_account=default_account,
+            account_emails=account_emails,
+        )
     finally:
         pass
 
@@ -146,9 +218,37 @@ mcp = FastMCP(
 )
 
 
-def _get_service(ctx: Context) -> Any:
-    """Extract the Gmail service from the lifespan context."""
-    return ctx.request_context.lifespan_context.service
+def _get_service(ctx: Context, account: str | None = None) -> Any:
+    """Extract the Gmail service for the given account (or default)."""
+    gmail_ctx: GmailContext = ctx.request_context.lifespan_context
+    name = account or gmail_ctx.default_account
+    if name not in gmail_ctx.services:
+        available = list(gmail_ctx.services.keys())
+        raise ValueError(
+            f"Unknown account '{name}'. Available accounts: {available}"
+        )
+    return gmail_ctx.services[name]
+
+
+@mcp.tool()
+def gmail_list_accounts(ctx: Context) -> dict:
+    """List all configured Gmail accounts.
+
+    Returns account names, email addresses, and which is the default.
+    Use the account name as the 'account' parameter in other tools.
+
+    Args:
+        ctx: MCP context (injected automatically).
+    """
+    gmail_ctx: GmailContext = ctx.request_context.lifespan_context
+    accounts = []
+    for name in gmail_ctx.services:
+        accounts.append({
+            "name": name,
+            "email": gmail_ctx.account_emails.get(name, "unknown"),
+            "is_default": name == gmail_ctx.default_account,
+        })
+    return {"accounts": accounts, "default": gmail_ctx.default_account}
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +274,7 @@ def _attach_file(message: MIMEMultipart, file_path: str) -> None:
     else:
         att = MIMEBase(main_type, sub_type)
         att.set_payload(file_data)
+        encoders.encode_base64(att)
     att.add_header("Content-Disposition", "attachment", filename=path.name)
     message.attach(att)
 
@@ -402,6 +503,7 @@ def gmail_list_messages(
     max_results: int = 20,
     page_token: str | None = None,
     include_spam_trash: bool = False,
+    account: str | None = None,
 ) -> dict:
     """List messages from the user's mailbox.
 
@@ -412,9 +514,10 @@ def gmail_list_messages(
         max_results: Maximum messages to return (1-500, default 20).
         page_token: Token for the next page of results.
         include_spam_trash: Include SPAM and TRASH in results.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         kwargs = {
             "userId": "me",
             "maxResults": min(max(1, max_results), 500),
@@ -470,6 +573,7 @@ def gmail_get_message(
     ctx: Context,
     message_id: str,
     clean: bool = True,
+    account: str | None = None,
 ) -> dict:
     """Get a single email message by ID with full body, headers, and attachments.
 
@@ -479,9 +583,10 @@ def gmail_get_message(
         clean: If True (default), return only the new content of the message
                (strips quoted replies, signatures, and HTML body). Set to False
                for the raw unprocessed body text and HTML.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         msg = (
             service.users()
             .messages()
@@ -505,6 +610,7 @@ def gmail_get_thread(
     thread_id: str,
     offset: int = 0,
     limit: int | None = None,
+    account: str | None = None,
 ) -> dict:
     """Get an entire email thread as a deduplicated chronological conversation.
 
@@ -522,9 +628,10 @@ def gmail_get_thread(
         thread_id: The Gmail thread ID (available from search results as thread_id).
         offset: Start from this message index (0-based, default 0).
         limit: Maximum number of messages to return. None returns all messages.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         thread = (
             service.users()
             .threads()
@@ -585,11 +692,99 @@ def gmail_get_thread(
 
 
 @mcp.tool()
+def gmail_download_attachment(
+    ctx: Context, message_id: str, attachment_id: str, account: str | None = None
+) -> dict:
+    """Download an attachment from a message.
+
+    Returns the raw base64url-encoded data from the Gmail API.
+    Use gmail_save_attachment to decode and save to disk.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        message_id: The Gmail message ID containing the attachment.
+        attachment_id: The attachment ID (from gmail_get_message attachments list).
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        attachment = (
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=attachment_id)
+            .execute()
+        )
+        return {
+            "data": attachment.get("data", ""),
+            "size": attachment.get("size", 0),
+        }
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_save_attachment(
+    ctx: Context,
+    message_id: str,
+    attachment_id: str,
+    filename: str,
+    save_path: str,
+    account: str | None = None,
+) -> dict:
+    """Download and save an attachment to disk.
+
+    Creates the save directory if it doesn't exist.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        message_id: The Gmail message ID containing the attachment.
+        attachment_id: The attachment ID (from gmail_get_message attachments list).
+        filename: Name to save the file as.
+        save_path: Directory path to save the file in.
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        attachment = (
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=attachment_id)
+            .execute()
+        )
+
+        # Decode base64url data
+        data = attachment.get("data", "")
+        file_data = base64.urlsafe_b64decode(data)
+
+        # Create directory if needed
+        save_dir = Path(save_path).expanduser()
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Write file
+        file_path = save_dir / filename
+        file_path.write_bytes(file_data)
+
+        return {
+            "path": str(file_path),
+            "size": len(file_data),
+        }
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
 def gmail_search_messages(
     ctx: Context,
     query: str,
     max_results: int = 10,
     page_token: str | None = None,
+    account: str | None = None,
 ) -> dict:
     """Search messages using Gmail query syntax. Returns compact summaries.
 
@@ -600,9 +795,10 @@ def gmail_search_messages(
         query: Gmail search query (e.g. "from:alice has:attachment after:2024/01/01").
         max_results: Maximum messages to return (1-100, default 10).
         page_token: Token for the next page.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         capped = min(max(1, max_results), 100)
         kwargs = {"userId": "me", "q": query, "maxResults": capped}
         if page_token:
@@ -654,6 +850,7 @@ def gmail_list_drafts(
     max_results: int = 20,
     page_token: str | None = None,
     query: str | None = None,
+    account: str | None = None,
 ) -> dict:
     """List drafts from the user's mailbox.
 
@@ -662,9 +859,10 @@ def gmail_list_drafts(
         max_results: Maximum drafts to return (1-500, default 20).
         page_token: Token for the next page.
         query: Gmail search query to filter drafts.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         kwargs = {"userId": "me", "maxResults": min(max(1, max_results), 500)}
         if page_token:
             kwargs["pageToken"] = page_token
@@ -716,6 +914,7 @@ def gmail_send_message(
     attachment_paths: list[str] | None = None,
     reply_to_message_id: str | None = None,
     thread_id: str | None = None,
+    account: str | None = None,
 ) -> dict:
     """Send an email message.
 
@@ -730,6 +929,7 @@ def gmail_send_message(
         attachment_paths: List of absolute file paths to attach.
         reply_to_message_id: Message-ID header value to reply to (for threading).
         thread_id: Gmail thread ID to place this message in.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
         message_body = _build_message(
@@ -743,7 +943,7 @@ def gmail_send_message(
             reply_to_message_id=reply_to_message_id,
             thread_id=thread_id,
         )
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         sent = service.users().messages().send(userId="me", body=message_body).execute()
         return {
             "id": sent["id"],
@@ -766,6 +966,7 @@ def gmail_reply_on_message(
     bcc: str | None = None,
     html_body: str | None = None,
     attachment_paths: list[str] | None = None,
+    account: str | None = None,
 ) -> dict:
     """Reply to an existing email message.
 
@@ -782,9 +983,10 @@ def gmail_reply_on_message(
         bcc: BCC recipients, comma-separated.
         html_body: HTML version of the reply body.
         attachment_paths: List of absolute file paths to attach.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
 
         # Fetch the original message headers
         original = (
@@ -900,6 +1102,7 @@ def gmail_create_draft(
     attachment_paths: list[str] | None = None,
     reply_to_message_id: str | None = None,
     thread_id: str | None = None,
+    account: str | None = None,
 ) -> dict:
     """Create a draft email message without sending it.
 
@@ -914,6 +1117,7 @@ def gmail_create_draft(
         attachment_paths: List of absolute file paths to attach.
         reply_to_message_id: Message-ID header value to reply to.
         thread_id: Gmail thread ID to place this draft in.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
         message_body = _build_message(
@@ -927,7 +1131,7 @@ def gmail_create_draft(
             reply_to_message_id=reply_to_message_id,
             thread_id=thread_id,
         )
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         draft = (
             service.users()
             .drafts()
@@ -952,6 +1156,7 @@ def gmail_update_draft(
     bcc: str | None = None,
     html_body: str | None = None,
     attachment_paths: list[str] | None = None,
+    account: str | None = None,
 ) -> dict:
     """Update an existing draft. Only provided fields are changed.
 
@@ -967,9 +1172,10 @@ def gmail_update_draft(
         bcc: New BCC recipients. None keeps existing.
         html_body: New HTML body. None keeps existing.
         attachment_paths: New file attachments (replaces all).
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         existing = (
             service.users()
             .drafts()
@@ -1002,15 +1208,16 @@ def gmail_update_draft(
 
 
 @mcp.tool()
-def gmail_delete_draft(ctx: Context, draft_id: str) -> dict:
+def gmail_delete_draft(ctx: Context, draft_id: str, account: str | None = None) -> dict:
     """Permanently delete a draft. This cannot be undone.
 
     Args:
         ctx: MCP context (injected automatically).
         draft_id: The ID of the draft to delete.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         service.users().drafts().delete(userId="me", id=draft_id).execute()
         return {"success": True}
     except HttpError as e:
@@ -1020,15 +1227,16 @@ def gmail_delete_draft(ctx: Context, draft_id: str) -> dict:
 
 
 @mcp.tool()
-def gmail_send_draft(ctx: Context, draft_id: str) -> dict:
+def gmail_send_draft(ctx: Context, draft_id: str, account: str | None = None) -> dict:
     """Send an existing draft. The draft is deleted after sending.
 
     Args:
         ctx: MCP context (injected automatically).
         draft_id: The ID of the draft to send.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         result = (
             service.users().drafts().send(userId="me", body={"id": draft_id}).execute()
         )
@@ -1040,14 +1248,15 @@ def gmail_send_draft(ctx: Context, draft_id: str) -> dict:
 
 
 @mcp.tool()
-def gmail_list_labels(ctx: Context) -> dict:
+def gmail_list_labels(ctx: Context, account: str | None = None) -> dict:
     """List all labels in the user's mailbox (system and user-created).
 
     Args:
         ctx: MCP context (injected automatically).
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         response = service.users().labels().list(userId="me").execute()
         labels = [
             {"id": l["id"], "name": l["name"], "type": l.get("type", "")}
@@ -1061,15 +1270,16 @@ def gmail_list_labels(ctx: Context) -> dict:
 
 
 @mcp.tool()
-def gmail_create_label(ctx: Context, name: str) -> dict:
+def gmail_create_label(ctx: Context, name: str, account: str | None = None) -> dict:
     """Create a new user label. Use "/" for nesting (e.g. "Projects/Work").
 
     Args:
         ctx: MCP context (injected automatically).
         name: Display name for the new label.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         label = (
             service.users()
             .labels()
@@ -1091,15 +1301,16 @@ def gmail_create_label(ctx: Context, name: str) -> dict:
 
 
 @mcp.tool()
-def gmail_delete_label(ctx: Context, label_id: str) -> dict:
+def gmail_delete_label(ctx: Context, label_id: str, account: str | None = None) -> dict:
     """Delete a user label. System labels cannot be deleted.
 
     Args:
         ctx: MCP context (injected automatically).
         label_id: The ID of the label to delete.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         service.users().labels().delete(userId="me", id=label_id).execute()
         return {"success": True}
     except HttpError as e:
@@ -1114,6 +1325,7 @@ def gmail_modify_message_labels(
     message_id: str,
     add_label_ids: list[str] | None = None,
     remove_label_ids: list[str] | None = None,
+    account: str | None = None,
 ) -> dict:
     """Add or remove labels from a message.
 
@@ -1122,9 +1334,10 @@ def gmail_modify_message_labels(
         message_id: The message ID to modify.
         add_label_ids: Label IDs to add (e.g. ["STARRED"]).
         remove_label_ids: Label IDs to remove (e.g. ["UNREAD"]).
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         body = {}
         if add_label_ids:
             body["addLabelIds"] = add_label_ids
@@ -1148,15 +1361,16 @@ def gmail_modify_message_labels(
 
 
 @mcp.tool()
-def gmail_trash_message(ctx: Context, message_id: str) -> dict:
+def gmail_trash_message(ctx: Context, message_id: str, account: str | None = None) -> dict:
     """Move a message to trash. Auto-deleted after 30 days.
 
     Args:
         ctx: MCP context (injected automatically).
         message_id: The message ID to trash.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         result = service.users().messages().trash(userId="me", id=message_id).execute()
         return {"id": result["id"], "label_ids": result.get("labelIds", [])}
     except HttpError as e:
@@ -1166,15 +1380,16 @@ def gmail_trash_message(ctx: Context, message_id: str) -> dict:
 
 
 @mcp.tool()
-def gmail_untrash_message(ctx: Context, message_id: str) -> dict:
+def gmail_untrash_message(ctx: Context, message_id: str, account: str | None = None) -> dict:
     """Restore a message from trash.
 
     Args:
         ctx: MCP context (injected automatically).
         message_id: The message ID to restore.
+        account: (Optional) Account name. Defaults to the default account.
     """
     try:
-        service = _get_service(ctx)
+        service = _get_service(ctx, account)
         result = (
             service.users().messages().untrash(userId="me", id=message_id).execute()
         )
@@ -1192,22 +1407,35 @@ def gmail_untrash_message(ctx: Context, message_id: str) -> dict:
 
 def auth():
     """Run OAuth flow and verify authentication."""
-    print(f"Credentials path: {CREDENTIALS_PATH}")
-    print(f"Token path:       {TOKEN_PATH}")
-    print()
-
-    try:
-        service = _authenticate()
-        profile = service.users().getProfile(userId="me").execute()
-        print(f"Authenticated as: {profile['emailAddress']}")
-        print(f"Total messages:   {profile['messagesTotal']}")
-        print(f"Token saved to:   {TOKEN_PATH}")
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Authentication failed: {e}")
-        sys.exit(1)
+    if ACCOUNTS_CONFIG_PATH:
+        config_path = Path(ACCOUNTS_CONFIG_PATH).expanduser()
+        print(f"Accounts config: {config_path}")
+        print()
+        try:
+            services, default_account, emails = _load_accounts_config()
+            for name in services:
+                marker = " (default)" if name == default_account else ""
+                print(f"  [{name}]{marker}: {emails.get(name, 'unknown')}")
+            print(f"\nAll {len(services)} account(s) authenticated successfully.")
+        except Exception as e:
+            print(f"Authentication failed: {e}")
+            sys.exit(1)
+    else:
+        print(f"Credentials path: {CREDENTIALS_PATH}")
+        print(f"Token path:       {TOKEN_PATH}")
+        print()
+        try:
+            service = _authenticate()
+            profile = service.users().getProfile(userId="me").execute()
+            print(f"Authenticated as: {profile['emailAddress']}")
+            print(f"Total messages:   {profile['messagesTotal']}")
+            print(f"Token saved to:   {TOKEN_PATH}")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Authentication failed: {e}")
+            sys.exit(1)
 
 
 def main():
