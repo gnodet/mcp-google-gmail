@@ -1401,6 +1401,460 @@ def gmail_untrash_message(ctx: Context, message_id: str, account: str | None = N
 
 
 # ---------------------------------------------------------------------------
+# Batch Operations
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def gmail_batch_delete_messages(
+    ctx: Context, message_ids: list[str], account: str | None = None
+) -> dict:
+    """Permanently delete up to 1000 messages by ID list.
+
+    This is a destructive operation that cannot be undone. Messages are
+    immediately and permanently deleted (not moved to trash).
+
+    Args:
+        ctx: MCP context (injected automatically).
+        message_ids: List of message IDs to delete (max 1000).
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        if not message_ids:
+            return {"error": "message_ids cannot be empty"}
+        if len(message_ids) > 1000:
+            return {"error": "Cannot delete more than 1000 messages at once"}
+        service = _get_service(ctx, account)
+        service.users().messages().batchDelete(
+            userId="me", body={"ids": message_ids}
+        ).execute()
+        return {"success": True, "deleted_count": len(message_ids)}
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_batch_modify_messages(
+    ctx: Context,
+    message_ids: list[str],
+    add_label_ids: list[str] | None = None,
+    remove_label_ids: list[str] | None = None,
+    account: str | None = None,
+) -> dict:
+    """Add or remove labels on up to 1000 messages at once.
+
+    More efficient than modifying messages individually when working with
+    multiple messages. Example: archive multiple messages by removing "INBOX"
+    label, or mark multiple messages as read by removing "UNREAD" label.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        message_ids: List of message IDs to modify (max 1000).
+        add_label_ids: Label IDs to add to all messages (e.g. ["STARRED"]).
+        remove_label_ids: Label IDs to remove from all messages (e.g. ["UNREAD", "INBOX"]).
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        if not message_ids:
+            return {"error": "message_ids cannot be empty"}
+        if len(message_ids) > 1000:
+            return {"error": "Cannot modify more than 1000 messages at once"}
+        body = {"ids": message_ids}
+        if add_label_ids:
+            body["addLabelIds"] = add_label_ids
+        if remove_label_ids:
+            body["removeLabelIds"] = remove_label_ids
+        if not add_label_ids and not remove_label_ids:
+            return {
+                "error": "Provide at least one of add_label_ids or remove_label_ids"
+            }
+        service = _get_service(ctx, account)
+        service.users().messages().batchModify(userId="me", body=body).execute()
+        return {"success": True, "modified_count": len(message_ids)}
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Thread Operations
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def gmail_list_threads(
+    ctx: Context,
+    query: str | None = None,
+    label_ids: list[str] | None = None,
+    max_results: int = 20,
+    page_token: str | None = None,
+    include_spam_trash: bool = False,
+    account: str | None = None,
+) -> dict:
+    """List email threads (conversations) from the user's mailbox.
+
+    Threads group related messages together. Use gmail_get_thread to read
+    the full conversation.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        query: Gmail search query (e.g. "is:unread", "from:alice@example.com").
+        label_ids: Filter by label IDs (e.g. ["INBOX"], ["STARRED"]).
+        max_results: Maximum threads to return (1-500, default 20).
+        page_token: Token for the next page of results.
+        include_spam_trash: Include SPAM and TRASH in results.
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        kwargs = {
+            "userId": "me",
+            "maxResults": min(max(1, max_results), 500),
+            "includeSpamTrash": include_spam_trash,
+        }
+        if query:
+            kwargs["q"] = query
+        if label_ids:
+            kwargs["labelIds"] = label_ids
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        response = service.users().threads().list(**kwargs).execute()
+        threads = []
+        for stub in response.get("threads", []):
+            # Get thread metadata without full message content
+            thread = (
+                service.users()
+                .threads()
+                .get(userId="me", id=stub["id"], format="metadata", metadataHeaders=["Subject", "From", "Date"])
+                .execute()
+            )
+            # Get subject from first message
+            first_msg = thread.get("messages", [{}])[0]
+            headers = {
+                h["name"]: h["value"]
+                for h in first_msg.get("payload", {}).get("headers", [])
+            }
+            threads.append(
+                {
+                    "thread_id": thread["id"],
+                    "snippet": thread.get("snippet", ""),
+                    "subject": headers.get("Subject", ""),
+                    "from": headers.get("From", ""),
+                    "date": headers.get("Date", ""),
+                    "message_count": len(thread.get("messages", [])),
+                }
+            )
+        return {
+            "threads": threads,
+            "next_page_token": response.get("nextPageToken"),
+            "result_size_estimate": response.get("resultSizeEstimate", 0),
+        }
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_modify_thread_labels(
+    ctx: Context,
+    thread_id: str,
+    add_label_ids: list[str] | None = None,
+    remove_label_ids: list[str] | None = None,
+    account: str | None = None,
+) -> dict:
+    """Add or remove labels from all messages in a thread.
+
+    Modifies all messages in the thread at once. Useful for archiving or
+    starring entire conversations.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        thread_id: The thread ID to modify.
+        add_label_ids: Label IDs to add to all messages in thread (e.g. ["STARRED"]).
+        remove_label_ids: Label IDs to remove from all messages in thread (e.g. ["UNREAD", "INBOX"]).
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        body = {}
+        if add_label_ids:
+            body["addLabelIds"] = add_label_ids
+        if remove_label_ids:
+            body["removeLabelIds"] = remove_label_ids
+        if not body:
+            return {
+                "error": "Provide at least one of add_label_ids or remove_label_ids"
+            }
+        service = _get_service(ctx, account)
+        result = (
+            service.users()
+            .threads()
+            .modify(userId="me", id=thread_id, body=body)
+            .execute()
+        )
+        return {"thread_id": result["id"], "messages": len(result.get("messages", []))}
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_trash_thread(ctx: Context, thread_id: str, account: str | None = None) -> dict:
+    """Move an entire thread (conversation) to trash.
+
+    All messages in the thread are moved to trash and will be auto-deleted
+    after 30 days. Can be restored with gmail_untrash_thread.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        thread_id: The thread ID to trash.
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        result = service.users().threads().trash(userId="me", id=thread_id).execute()
+        return {"thread_id": result["id"], "messages": len(result.get("messages", []))}
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_untrash_thread(ctx: Context, thread_id: str, account: str | None = None) -> dict:
+    """Restore an entire thread (conversation) from trash.
+
+    All messages in the thread are restored from trash.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        thread_id: The thread ID to restore.
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        result = service.users().threads().untrash(userId="me", id=thread_id).execute()
+        return {"thread_id": result["id"], "messages": len(result.get("messages", []))}
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Filter Management
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def gmail_list_filters(ctx: Context, account: str | None = None) -> dict:
+    """List all mail filters for the user's account.
+
+    Filters automatically organize incoming mail by applying labels, archiving,
+    marking as read, starring, forwarding, or deleting messages that match
+    specific criteria.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        response = service.users().settings().filters().list(userId="me").execute()
+        filters = []
+        for f in response.get("filter", []):
+            criteria = f.get("criteria", {})
+            action = f.get("action", {})
+            filters.append(
+                {
+                    "id": f.get("id", ""),
+                    "criteria": criteria,
+                    "action": action,
+                }
+            )
+        return {"filters": filters, "count": len(filters)}
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_filter(ctx: Context, filter_id: str, account: str | None = None) -> dict:
+    """Get a specific mail filter by ID.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        filter_id: The filter ID to retrieve.
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        filter_obj = (
+            service.users().settings().filters().get(userId="me", id=filter_id).execute()
+        )
+        return {
+            "id": filter_obj.get("id", ""),
+            "criteria": filter_obj.get("criteria", {}),
+            "action": filter_obj.get("action", {}),
+        }
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_create_filter(
+    ctx: Context,
+    from_email: str | None = None,
+    to_email: str | None = None,
+    subject: str | None = None,
+    query: str | None = None,
+    negated_query: str | None = None,
+    has_attachment: bool | None = None,
+    exclude_chats: bool | None = None,
+    size: int | None = None,
+    size_comparison: str | None = None,
+    add_label_ids: list[str] | None = None,
+    remove_label_ids: list[str] | None = None,
+    forward_to: str | None = None,
+    mark_as_read: bool | None = None,
+    mark_as_important: bool | None = None,
+    mark_as_spam: bool | None = None,
+    star: bool | None = None,
+    archive: bool | None = None,
+    trash: bool | None = None,
+    account: str | None = None,
+) -> dict:
+    """Create a new mail filter with criteria and actions.
+
+    Filters automatically process incoming mail. At least one criteria field
+    must be provided. At least one action must be specified.
+
+    Criteria fields:
+        from_email: Match sender email/domain (e.g. "alice@example.com" or "example.com").
+        to_email: Match recipient email/domain.
+        subject: Match subject line text.
+        query: Gmail search query (e.g. "has:attachment larger:5M").
+        negated_query: Messages NOT matching this query.
+        has_attachment: If True, match only messages with attachments.
+        exclude_chats: If True, exclude chat messages.
+        size: Size threshold in bytes.
+        size_comparison: "larger" or "smaller" (required if size is specified).
+
+    Action fields:
+        add_label_ids: Label IDs to apply to matching messages.
+        remove_label_ids: Label IDs to remove from matching messages.
+        forward_to: Email address to forward matching messages to.
+        mark_as_read: If True, mark as read.
+        mark_as_important: If True, mark as important. If False, mark as not important.
+        mark_as_spam: If True, move to spam.
+        star: If True, star the message.
+        archive: If True, remove from inbox (archive).
+        trash: If True, move to trash.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        (criteria and action fields as described above)
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        criteria = {}
+        if from_email:
+            criteria["from"] = from_email
+        if to_email:
+            criteria["to"] = to_email
+        if subject:
+            criteria["subject"] = subject
+        if query:
+            criteria["query"] = query
+        if negated_query:
+            criteria["negatedQuery"] = negated_query
+        if has_attachment is not None:
+            criteria["hasAttachment"] = has_attachment
+        if exclude_chats is not None:
+            criteria["excludeChats"] = exclude_chats
+        if size is not None:
+            if size_comparison not in ["larger", "smaller"]:
+                return {"error": "size_comparison must be 'larger' or 'smaller' when size is specified"}
+            criteria["size"] = size
+            criteria["sizeComparison"] = size_comparison
+
+        if not criteria:
+            return {"error": "At least one criteria field must be provided"}
+
+        action = {}
+        if add_label_ids:
+            action["addLabelIds"] = add_label_ids
+        if remove_label_ids:
+            action["removeLabelIds"] = remove_label_ids
+        if forward_to:
+            action["forward"] = forward_to
+        if mark_as_read is not None:
+            if mark_as_read:
+                action["removeLabelIds"] = action.get("removeLabelIds", []) + ["UNREAD"]
+        if mark_as_important is not None:
+            if mark_as_important:
+                action["addLabelIds"] = action.get("addLabelIds", []) + ["IMPORTANT"]
+            else:
+                action["removeLabelIds"] = action.get("removeLabelIds", []) + ["IMPORTANT"]
+        if mark_as_spam is not None and mark_as_spam:
+            action["addLabelIds"] = action.get("addLabelIds", []) + ["SPAM"]
+        if star is not None and star:
+            action["addLabelIds"] = action.get("addLabelIds", []) + ["STARRED"]
+        if archive is not None and archive:
+            action["removeLabelIds"] = action.get("removeLabelIds", []) + ["INBOX"]
+        if trash is not None and trash:
+            action["addLabelIds"] = action.get("addLabelIds", []) + ["TRASH"]
+
+        if not action:
+            return {"error": "At least one action must be specified"}
+
+        service = _get_service(ctx, account)
+        filter_obj = (
+            service.users()
+            .settings()
+            .filters()
+            .create(userId="me", body={"criteria": criteria, "action": action})
+            .execute()
+        )
+        return {
+            "id": filter_obj.get("id", ""),
+            "criteria": filter_obj.get("criteria", {}),
+            "action": filter_obj.get("action", {}),
+        }
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_delete_filter(ctx: Context, filter_id: str, account: str | None = None) -> dict:
+    """Delete a mail filter by ID. This cannot be undone.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        filter_id: The filter ID to delete.
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        service.users().settings().filters().delete(userId="me", id=filter_id).execute()
+        return {"success": True}
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

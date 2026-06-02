@@ -63,10 +63,13 @@ You're ready! Start issuing commands via your MCP client.
 
 *   **Full Gmail Access:** Read, search, send, draft, reply, label, and trash emails.
 *   **Multi-Account Support:** Manage multiple Gmail accounts from a single server instance.
-*   **21 Tools** covering all common Gmail operations.
+*   **30 Tools** covering all common Gmail operations — now including batch operations, thread management, and filter management.
 *   **Flexible Authentication:** Supports OAuth 2.0, Service Accounts, Base64 injection, and Application Default Credentials.
 *   **Pagination:** All list operations support `page_token` and `max_results`.
 *   **Thread Fetching:** Retrieve entire threads with deduplicated, cleaned conversation text.
+*   **Batch Operations:** Modify or delete up to 1000 messages at once.
+*   **Thread Management:** List, modify, trash, and restore entire conversations.
+*   **Filter Management:** Create, list, and delete Gmail filters programmatically.
 *   **Attachment Handling:** Send emails with attachments, download attachments, save to disk.
 *   **Smart Reply:** Reply to messages with automatic threading, subject prefixing, and reply-all support.
 *   **HTML Email:** Send plain text and/or HTML bodies.
@@ -180,7 +183,7 @@ Best when you need to manage multiple Gmail accounts from a single MCP server in
 
 ---
 
-## 🛠️ Available Tools (21 Total)
+## 🛠️ Available Tools (30 Total)
 
 ### Account Management
 
@@ -320,6 +323,74 @@ Best when you need to manage multiple Gmail accounts from a single MCP server in
     *   `message_id`: The message ID
     *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{id, label_ids}`
+
+### Batch Operations
+
+*   **`gmail_batch_delete_messages`** — Permanently delete up to 1000 messages at once
+    *   `message_ids`: List of message IDs to delete (max 1000)
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{success: true, deleted_count}`
+    *   ⚠️ Destructive operation — messages are permanently deleted, not moved to trash
+
+*   **`gmail_batch_modify_messages`** — Add/remove labels on up to 1000 messages at once
+    *   `message_ids`: List of message IDs to modify (max 1000)
+    *   `add_label_ids` (optional): Label IDs to add
+    *   `remove_label_ids` (optional): Label IDs to remove
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{success: true, modified_count}`
+    *   More efficient than individual `modify_message_labels` calls for bulk operations
+
+### Thread Operations
+
+*   **`gmail_list_threads`** — List email threads (conversations) with filtering
+    *   `query` (optional): Gmail search query (e.g. `"is:unread"`)
+    *   `label_ids` (optional): Filter by label IDs
+    *   `max_results` (optional, default 20): Threads per page (1-500)
+    *   `page_token` (optional): Token for next page
+    *   `include_spam_trash` (optional, default false): Include spam/trash
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{threads: [{thread_id, snippet, subject, from, date, message_count}], next_page_token, result_size_estimate}`
+
+*   **`gmail_modify_thread_labels`** — Add/remove labels from all messages in a thread
+    *   `thread_id`: The thread ID to modify
+    *   `add_label_ids` (optional): Label IDs to add to all messages in thread
+    *   `remove_label_ids` (optional): Label IDs to remove from all messages in thread
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{thread_id, messages}`
+
+*   **`gmail_trash_thread`** — Move an entire thread to trash
+    *   `thread_id`: The thread ID to trash
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{thread_id, messages}`
+    *   All messages in the thread are trashed and will be auto-deleted after 30 days
+
+*   **`gmail_untrash_thread`** — Restore an entire thread from trash
+    *   `thread_id`: The thread ID to restore
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{thread_id, messages}`
+
+### Filter Management
+
+*   **`gmail_list_filters`** — List all mail filters
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{filters: [{id, criteria, action}], count}`
+
+*   **`gmail_get_filter`** — Get a specific filter by ID
+    *   `filter_id`: The filter ID
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{id, criteria, action}`
+
+*   **`gmail_create_filter`** — Create a new mail filter with criteria and actions
+    *   **Criteria** (at least one required): `from_email`, `to_email`, `subject`, `query`, `negated_query`, `has_attachment`, `exclude_chats`, `size`, `size_comparison`
+    *   **Actions** (at least one required): `add_label_ids`, `remove_label_ids`, `forward_to`, `mark_as_read`, `mark_as_important`, `mark_as_spam`, `star`, `archive`, `trash`
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{id, criteria, action}`
+    *   See [FEATURES.md](FEATURES.md) for detailed examples
+
+*   **`gmail_delete_filter`** — Delete a mail filter by ID
+    *   `filter_id`: The filter ID to delete
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{success: true}`
 
 ---
 
@@ -484,6 +555,12 @@ For **Service Accounts**: Go to Credentials → Create Credentials → Service A
 *   "Trash all promotional emails from the last week"
 *   "Show me the full content of message ID abc123"
 *   "What are my unread emails about project deadlines?"
+*   "Archive all emails from the last month with IDs [id1, id2, id3, ...]" (batch operations)
+*   "List all my email threads from alice@example.com"
+*   "Archive the entire conversation with thread ID xyz789"
+*   "Create a filter to automatically label all emails from github.com as 'GitHub'"
+*   "Show me all my current email filters"
+*   "Delete filter ID filter123"
 
 ### Multi-Account
 *   "List all my configured Gmail accounts"
