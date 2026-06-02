@@ -529,6 +529,93 @@ def gmail_get_message(ctx: Context, message_id: str, account: str | None = None)
 
 
 @mcp.tool()
+def gmail_download_attachment(
+    ctx: Context, message_id: str, attachment_id: str, account: str | None = None
+) -> dict:
+    """Download an attachment from a message.
+
+    Returns the raw base64url-encoded data from the Gmail API.
+    Use gmail_save_attachment to decode and save to disk.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        message_id: The Gmail message ID containing the attachment.
+        attachment_id: The attachment ID (from gmail_get_message attachments list).
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        attachment = (
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=attachment_id)
+            .execute()
+        )
+        return {
+            "data": attachment.get("data", ""),
+            "size": attachment.get("size", 0),
+        }
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_save_attachment(
+    ctx: Context,
+    message_id: str,
+    attachment_id: str,
+    filename: str,
+    save_path: str,
+    account: str | None = None,
+) -> dict:
+    """Download and save an attachment to disk.
+
+    Creates the save directory if it doesn't exist.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        message_id: The Gmail message ID containing the attachment.
+        attachment_id: The attachment ID (from gmail_get_message attachments list).
+        filename: Name to save the file as.
+        save_path: Directory path to save the file in.
+        account: (Optional) Account name. Defaults to the default account.
+    """
+    try:
+        service = _get_service(ctx, account)
+        attachment = (
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=attachment_id)
+            .execute()
+        )
+
+        # Decode base64url data
+        data = attachment.get("data", "")
+        file_data = base64.urlsafe_b64decode(data)
+
+        # Create directory if needed
+        save_dir = Path(save_path).expanduser()
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Write file
+        file_path = save_dir / filename
+        file_path.write_bytes(file_data)
+
+        return {
+            "path": str(file_path),
+            "size": len(file_data),
+        }
+    except HttpError as e:
+        return {"error": str(e), "status_code": e.resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
 def gmail_search_messages(
     ctx: Context,
     query: str,
