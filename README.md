@@ -61,13 +61,14 @@ You're ready! Start issuing commands via your MCP client.
 
 ## ✨ Key Features
 
-*   **Full Gmail Access:** Read, search, send, draft, label, and trash emails.
+*   **Full Gmail Access:** Read, search, send, draft, reply, label, and trash emails.
 *   **Multi-Account Support:** Manage multiple Gmail accounts from a single server instance.
-*   **17 Tools** covering all common Gmail operations.
+*   **21 Tools** covering all common Gmail operations.
 *   **Flexible Authentication:** Supports OAuth 2.0, Service Accounts, Base64 injection, and Application Default Credentials.
 *   **Pagination:** All list operations support `page_token` and `max_results`.
-*   **Attachments:** Send emails with file attachments.
-*   **Reply Threading:** Reply to existing threads with proper In-Reply-To headers.
+*   **Thread Fetching:** Retrieve entire threads with deduplicated, cleaned conversation text.
+*   **Attachment Handling:** Send emails with attachments, download attachments, save to disk.
+*   **Smart Reply:** Reply to messages with automatic threading, subject prefixing, and reply-all support.
 *   **HTML Email:** Send plain text and/or HTML bodies.
 *   **Stdio & SSE Transports:** Works with Claude Desktop, Cursor, and remote/container deployments.
 
@@ -179,12 +180,13 @@ Best when you need to manage multiple Gmail accounts from a single MCP server in
 
 ---
 
-## 🛠️ Available Tools (17 Total)
+## 🛠️ Available Tools (21 Total)
 
 ### Account Management
 
 *   **`gmail_list_accounts`** — List all configured Gmail accounts
     *   _Returns:_ `{accounts: [{name, email, is_default}], default}`
+    *   Use the `account` name from this list as the `account` parameter in all other tools
 
 ### Read Operations
 
@@ -194,23 +196,54 @@ Best when you need to manage multiple Gmail accounts from a single MCP server in
     *   `max_results` (optional, default 20): Messages per page (1-500)
     *   `page_token` (optional): Token for next page
     *   `include_spam_trash` (optional, default false): Include spam/trash
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{messages: [{id, thread_id, snippet, subject, from, date}], next_page_token, result_size_estimate}`
 
 *   **`gmail_get_message`** — Get full message by ID (headers, body, attachments)
     *   `message_id`: The Gmail message ID
+    *   `clean` (optional, default true): Strip quoted replies and signatures, return only new content
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{id, thread_id, subject, from, to, cc, date, body_text, body_html, labels, attachments}`
+
+*   **`gmail_get_thread`** — Get entire email thread with clean, deduplicated conversation text
+    *   `thread_id`: The Gmail thread ID
+    *   `offset` (optional, default 0): Start from this message index (0-based)
+    *   `limit` (optional): Maximum messages to return (None = all messages)
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{thread_id, subject, message_count, messages: [{id, from, to, cc, date, body_text, attachments}], offset, limit, next_offset}`
+    *   Automatically strips quoted replies and signatures from each message, showing only NEW content
+    *   Far more token-efficient than fetching messages individually for long threads
 
 *   **`gmail_search_messages`** — Search with Gmail query syntax, returns compact summaries (1-100 per page). Use `gmail_get_message` to read the full body of a result.
     *   `query`: Gmail search query (e.g. `"has:attachment after:2024/01/01"`)
     *   `max_results` (optional, default 10): Results per page (1-100)
     *   `page_token` (optional): Token for next page
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{messages: [{id, thread_id, snippet, subject, from, to, date, labels}], next_page_token, result_size_estimate}`
 
 *   **`gmail_list_drafts`** — List drafts with pagination and query filter
     *   `max_results` (optional, default 20): Drafts per page (1-500)
     *   `page_token` (optional): Token for next page
     *   `query` (optional): Gmail search query to filter drafts
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{drafts: [{draft_id, message_id, subject, to, snippet}], next_page_token, result_size_estimate}`
+
+### Attachment Operations
+
+*   **`gmail_download_attachment`** — Download attachment from a message
+    *   `message_id`: The Gmail message ID containing the attachment
+    *   `attachment_id`: The attachment ID (from `gmail_get_message` attachments list)
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{data: base64url_encoded_data, size}`
+
+*   **`gmail_save_attachment`** — Download and save attachment to disk
+    *   `message_id`: The Gmail message ID containing the attachment
+    *   `attachment_id`: The attachment ID (from `gmail_get_message` attachments list)
+    *   `filename`: Name to save the file as
+    *   `save_path`: Directory path to save the file in
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{path, size}`
+    *   Creates the save directory if it doesn't exist
 
 ### Send Operations
 
@@ -218,50 +251,74 @@ Best when you need to manage multiple Gmail accounts from a single MCP server in
     *   `to`, `subject`, `body` (required)
     *   `cc`, `bcc`, `html_body`, `attachment_paths` (optional)
     *   `reply_to_message_id`, `thread_id` (optional, for threading)
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{id, thread_id, label_ids}`
 
+*   **`gmail_reply_on_message`** — Reply to an existing email message
+    *   `message_id`: The Gmail message ID to reply to
+    *   `body`: Plain text reply body
+    *   `reply_all` (optional, default false): Reply to all original recipients (To + CC)
+    *   `cc`, `bcc`, `html_body`, `attachment_paths` (optional)
+    *   `account` (optional): Account name for multi-account setups
+    *   _Returns:_ `{id, thread_id, label_ids}`
+    *   Automatically fetches original message to set correct recipient, subject ("Re:" prefix), thread ID, and In-Reply-To headers
+    *   Handles Reply-To headers, excludes your own email from recipients, merges CC lists when reply_all is true
+
 *   **`gmail_create_draft`** — Create a draft without sending (same params as send)
+    *   `to`, `subject`, `body` (required)
+    *   `cc`, `bcc`, `html_body`, `attachment_paths` (optional)
+    *   `reply_to_message_id`, `thread_id` (optional, for threading)
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{draft_id, message_id}`
 
 *   **`gmail_update_draft`** — Update an existing draft (merges provided fields with existing)
     *   `draft_id` (required), all other fields optional
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{draft_id, message_id}`
 
 *   **`gmail_delete_draft`** — Permanently delete a draft
     *   `draft_id` (required)
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{success: true}`
 
 *   **`gmail_send_draft`** — Send an existing draft
     *   `draft_id` (required)
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{message_id, thread_id}`
 
 ### Label Operations
 
 *   **`gmail_list_labels`** — List all labels (system and user-created)
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{labels: [{id, name, type}]}`
 
 *   **`gmail_create_label`** — Create a new label (supports nesting with `/`)
     *   `name`: Label name (e.g. `"Projects/Work"`)
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{id, name}`
 
 *   **`gmail_delete_label`** — Delete a user label (system labels cannot be deleted)
     *   `label_id`: The label ID
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{success: true}`
 
 *   **`gmail_modify_message_labels`** — Add/remove labels from a message
     *   `message_id` (required)
     *   `add_label_ids` (optional): Label IDs to add
     *   `remove_label_ids` (optional): Label IDs to remove
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{id, label_ids}`
 
 ### Trash Operations
 
 *   **`gmail_trash_message`** — Move a message to trash (auto-deleted after 30 days)
     *   `message_id`: The message ID
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{id, label_ids}`
 
 *   **`gmail_untrash_message`** — Restore a message from trash
     *   `message_id`: The message ID
+    *   `account` (optional): Account name for multi-account setups
     *   _Returns:_ `{id, label_ids}`
 
 ---
@@ -414,14 +471,26 @@ For **Service Accounts**: Go to Credentials → Create Credentials → Service A
 
 ## 💬 Example Prompts for Claude
 
+### Single Account
 *   "List my 10 most recent unread emails"
 *   "Search for emails from alice@example.com with attachments"
 *   "Send an email to bob@example.com with subject 'Meeting Notes' and the body 'Here are the notes from today.'"
+*   "Reply to message ID abc123 with 'Thanks for the update!'"
+*   "Reply to all recipients of message ID abc123"
+*   "Show me the full thread for thread ID xyz789"
+*   "Download the PDF attachment from message ID abc123 to ~/Downloads"
 *   "Create a draft reply to the last email from my manager"
 *   "Label all emails from newsletter@example.com as 'Newsletters'"
 *   "Trash all promotional emails from the last week"
 *   "Show me the full content of message ID abc123"
 *   "What are my unread emails about project deadlines?"
+
+### Multi-Account
+*   "List all my configured Gmail accounts"
+*   "Show me unread emails from my work account"
+*   "Send an email from my personal account to bob@example.com"
+*   "Reply to that email from my work account"
+*   "Check for new emails in both my personal and work accounts"
 
 ---
 
